@@ -1,0 +1,2391 @@
+--[[
+    pena // spread+recoil  v1.0.0
+    ============================================================================
+    Target game     : Penablox recode (Roblox, first-person arena / gunplay)
+    Target executor : Real Executor (Synapse / Script-Ware API family)
+    Keybind         : INSERT (rebindable, persisted when the filesystem API exists)
+    Changelog       :
+      1.0.0 - No Spread  : upvalue sweep -> global math.random patch -> shoot
+                           detour (direction overwrite) -> hook fallback.
+              No Recoil  : camera field zeroing, weapon stat override,
+                           post-shot visual correction.
+              Shell      : draggable / collapsible window, diagnostics ring
+                           buffer, config persistence, full unload path.
+    ============================================================================
+]]
+
+-- ============================================================================
+-- 1. IDEMPOTENT UNLOAD OF ANY PREVIOUS INSTANCE
+-- ============================================================================
+
+local REGISTRY_ENV = _G
+do
+    local ok, env = pcall(function()
+        return getgenv()
+    end)
+    if ok and type(env) == "table" then
+        REGISTRY_ENV = env
+    end
+end
+
+do
+    local previous = rawget(REGISTRY_ENV, "__pena")
+    if type(previous) == "table" and type(previous.unload) == "function" then
+        local ok, err = pcall(previous.unload)
+        if not ok then
+            warn("[pena] previous instance failed to unload cleanly: " .. tostring(err))
+        end
+    end
+end
+
+-- ============================================================================
+-- 2. SERVICE RESOLUTION (pcall-guarded)
+-- ============================================================================
+
+local Services = {}
+
+local function getService(name)
+    local ok, service = pcall(function()
+        return game:GetService(name)
+    end)
+    if ok and service then
+        return service
+    end
+    return nil
+end
+
+Services.Players = getService("Players")
+Services.RunService = getService("RunService")
+Services.UserInputService = getService("UserInputService")
+Services.TweenService = getService("TweenService")
+Services.HttpService = getService("HttpService")
+Services.ReplicatedStorage = getService("ReplicatedStorage")
+Services.Workspace = getService("Workspace")
+Services.CoreGui = getService("CoreGui")
+
+-- ============================================================================
+-- 3. EXECUTOR CAPABILITY PROBE
+-- ============================================================================
+
+local function fetchGlobal(name)
+    local ok, value = pcall(function()
+        return REGISTRY_ENV[name]
+    end)
+    if ok and value ~= nil then
+        return value
+    end
+    local okGlobal, globalValue = pcall(function()
+        return _G[name]
+    end)
+    if okGlobal and globalValue ~= nil then
+        return globalValue
+    end
+    return nil
+end
+
+local function asFunction(value)
+    if type(value) == "function" then
+        return value
+    end
+    return nil
+end
+
+local EXEC = {
+    identify = asFunction(fetchGlobal("identifyexecutor")),
+    hook = asFunction(fetchGlobal("hookfunction")) or asFunction(fetchGlobal("replaceclosure")),
+    getUpvalues = asFunction(fetchGlobal("getupvalues")),
+    setUpvalue = asFunction(fetchGlobal("setupvalue")),
+    getRawMeta = asFunction(fetchGlobal("getrawmetatable")),
+    setReadonly = asFunction(fetchGlobal("setreadonly")),
+    isReadonly = asFunction(fetchGlobal("isreadonly")),
+    makeWriteable = asFunction(fetchGlobal("make_writeable")),
+    getUpvalueName = nil,
+    setClipboard = asFunction(fetchGlobal("setclipboard")) or asFunction(fetchGlobal("toclipboard")),
+    writeFile = asFunction(fetchGlobal("writefile")),
+    readFile = asFunction(fetchGlobal("readfile")),
+    isFile = asFunction(fetchGlobal("isfile")),
+    makeFolder = asFunction(fetchGlobal("makefolder")),
+    isFolder = asFunction(fetchGlobal("isfolder")),
+}
+
+do
+    local dbg = fetchGlobal("debug")
+    if type(dbg) == "table" then
+        if not EXEC.getUpvalues and type(dbg.getupvalues) == "function" then
+            EXEC.getUpvalues = function(fn)
+                return dbg.getupvalues(fn)
+            end
+        end
+        if not EXEC.setUpvalue and type(dbg.setupvalue) == "function" then
+            EXEC.setUpvalue = function(fn, index, value)
+                return dbg.setupvalue(fn, index, value)
+            end
+        end
+        if type(dbg.getupvalue) == "function" then
+            EXEC.getUpvalueName = function(fn, index)
+                return dbg.getupvalue(fn, index)
+            end
+        end
+    end
+end
+
+-- ============================================================================
+-- 4. UTILITY LAYER
+-- ============================================================================
+
+local Diag = nil
+
+local function diag(level, text)
+    if Diag then
+        Diag.push(level, text)
+    else
+        print("[pena] " .. tostring(level) .. ": " .. tostring(text))
+    end
+end
+
+local function clamp(value, minimum, maximum)
+    if value < minimum then
+        return minimum
+    end
+    if value > maximum then
+        return maximum
+    end
+    return value
+end
+
+local function round(value)
+    return math.floor(value + 0.5)
+end
+
+local function safeCall(label, fn, ...)
+    local results = table.pack(pcall(fn, ...))
+    if not results[1] then
+        diag("error", label .. ": " .. tostring(results[2]))
+        return false
+    end
+    return true, table.unpack(results, 2, results.n)
+end
+
+local Connections = {}
+
+local function connect(signal, handler)
+    if not signal then
+        diag("warn", "connection skipped: signal unavailable")
+        return nil
+    end
+    local ok, connection = pcall(function()
+        return signal:Connect(handler)
+    end)
+    if not ok or not connection then
+        diag("warn", "connection failed: " .. tostring(signal))
+        return nil
+    end
+    Connections[#Connections + 1] = connection
+    return connection
+end
+
+local function dropConnection(connection)
+    if not connection then
+        return
+    end
+    safeCall("dropConnection", function()
+        connection:Disconnect()
+    end)
+    for index = #Connections, 1, -1 do
+        if Connections[index] == connection then
+            table.remove(Connections, index)
+        end
+    end
+end
+
+local function disconnectAll()
+    for index = #Connections, 1, -1 do
+        local connection = Connections[index]
+        Connections[index] = nil
+        if connection then
+            safeCall("disconnectAll", function()
+                connection:Disconnect()
+            end)
+        end
+    end
+end
+
+local function writeKey(tbl, key, value)
+    if type(tbl) ~= "table" then
+        return false, "not a table"
+    end
+
+    local okDirect = pcall(function()
+        tbl[key] = value
+    end)
+    if okDirect and rawget(tbl, key) == value then
+        return true
+    end
+
+    local locked = false
+    if EXEC.isReadonly then
+        local okState, state = pcall(EXEC.isReadonly, tbl)
+        if okState then
+            locked = state == true
+        end
+    end
+
+    if locked and EXEC.setReadonly then
+        safeCall("writeKey/unlock", EXEC.setReadonly, tbl, false)
+        local okWrite = pcall(function()
+            tbl[key] = value
+        end)
+        safeCall("writeKey/relock", EXEC.setReadonly, tbl, true)
+        if okWrite and rawget(tbl, key) == value then
+            return true
+        end
+    end
+
+    if EXEC.makeWriteable then
+        safeCall("writeKey/makeWriteable", EXEC.makeWriteable, tbl)
+        local okWrite = pcall(function()
+            tbl[key] = value
+        end)
+        if okWrite and rawget(tbl, key) == value then
+            return true
+        end
+    end
+
+    return false, "write blocked"
+end
+
+local function walkGraph(root, maxDepth, budget, visit)
+    local visited = {}
+    local work = 0
+    local stack = { { value = root, depth = 0 } }
+
+    while #stack > 0 and work < budget do
+        local entry = table.remove(stack)
+        local value = entry.value
+        local depth = entry.depth
+        local kind = type(value)
+
+        if (kind == "table" or kind == "function") and depth <= maxDepth and not visited[value] then
+            visited[value] = true
+            work = work + 1
+            visit(value, kind, depth)
+
+            if kind == "table" then
+                for _, child in pairs(value) do
+                    local childKind = type(child)
+                    if childKind == "table" or childKind == "function" then
+                        stack[#stack + 1] = { value = child, depth = depth + 1 }
+                    end
+                end
+            elseif EXEC.getUpvalues then
+                local okList, list = pcall(EXEC.getUpvalues, value)
+                if okList and type(list) == "table" then
+                    for _, child in ipairs(list) do
+                        local childKind = type(child)
+                        if childKind == "table" or childKind == "function" then
+                            stack[#stack + 1] = { value = child, depth = depth + 1 }
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return work
+end
+
+local ShotBus = {
+    listeners = {},
+    sourceKind = nil,
+}
+
+function ShotBus.subscribe(listener)
+    ShotBus.listeners[#ShotBus.listeners + 1] = listener
+    return function()
+        for index = #ShotBus.listeners, 1, -1 do
+            if ShotBus.listeners[index] == listener then
+                table.remove(ShotBus.listeners, index)
+            end
+        end
+    end
+end
+
+function ShotBus.fire(look, cameraCFrame)
+    for index = 1, #ShotBus.listeners do
+        local ok, err = pcall(ShotBus.listeners[index], look, cameraCFrame)
+        if not ok then
+            diag("error", "shot listener failed: " .. tostring(err))
+        end
+    end
+end
+
+function ShotBus.clear()
+    table.clear(ShotBus.listeners)
+    ShotBus.sourceKind = nil
+end
+
+local function getLocalCharacter()
+    local players = Services.Players
+    if not players then
+        return nil
+    end
+    local player = players.LocalPlayer
+    if not player then
+        return nil
+    end
+    return player.Character
+end
+
+local function isCharacterDead()
+    local character = getLocalCharacter()
+    if not character then
+        return true
+    end
+    local okDead, dead = pcall(function()
+        return character:GetAttribute("Dead")
+    end)
+    if okDead and dead == true then
+        return true
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.Health <= 0 then
+        return true
+    end
+    return false
+end
+
+-- ============================================================================
+-- 5. GAME SURFACE RESOLVER
+-- ============================================================================
+
+local Surface = {}
+
+local MODULE_TTL = 10
+local SCAN_DEPTH_LIMIT = 4
+local SCAN_NODE_BUDGET = 500
+local SCAN_QUEUE_CEILING = 2000
+local moduleCache = {}
+
+local function resolveNode(path)
+    local node = Services.ReplicatedStorage
+    if not node then
+        return nil
+    end
+    for _, name in ipairs(path) do
+        local ok, child = pcall(function()
+            return node:FindFirstChild(name)
+        end)
+        if not ok or not child then
+            return nil
+        end
+        node = child
+    end
+    return node
+end
+
+function Surface.requirePath(path)
+    local key = table.concat(path, ".")
+    local cached = moduleCache[key]
+    if cached and (os.clock() - cached.time) < MODULE_TTL then
+        return cached.value, cached.instance
+    end
+
+    local node = resolveNode(path)
+    if not node then
+        return nil, "missing: " .. key
+    end
+
+    local ok, result = pcall(require, node)
+    if not ok then
+        return nil, "require failed: " .. key .. " (" .. tostring(result) .. ")"
+    end
+
+    moduleCache[key] = { value = result, instance = node, time = os.clock() }
+    return result, node
+end
+
+function Surface.clearCache()
+    table.clear(moduleCache)
+end
+
+function Surface.findWeaponModule()
+    local root = Services.ReplicatedStorage
+    if not root then
+        return nil, "ReplicatedStorage unavailable"
+    end
+
+    local queue = { { node = root, depth = 0 } }
+    local head = 1
+    local budget = SCAN_NODE_BUDGET
+
+    while head <= #queue and budget > 0 do
+        local entry = queue[head]
+        head = head + 1
+        budget = budget - 1
+
+        local node = entry.node
+        local depth = entry.depth
+
+        if node:IsA("ModuleScript") then
+            local ok, module = pcall(require, node)
+            if ok and type(module) == "table" and type(module.shoot) == "function" then
+                return module, node
+            end
+        end
+
+        if depth < SCAN_DEPTH_LIMIT and #queue < SCAN_QUEUE_CEILING then
+            local okChildren, children = pcall(function()
+                return node:GetChildren()
+            end)
+            if okChildren and children then
+                for _, child in ipairs(children) do
+                    queue[#queue + 1] = { node = child, depth = depth + 1 }
+                end
+            end
+        end
+    end
+
+    local fallbackPath = { "Components", "Weapon" }
+    local fallback = Surface.requirePath(fallbackPath)
+    if type(fallback) == "table" and type(fallback.shoot) == "function" then
+        return fallback, resolveNode(fallbackPath)
+    end
+
+    return nil, "weapon module not located"
+end
+
+function Surface.findCameraController()
+    local direct = Surface.requirePath({ "Controllers", "CameraController" })
+    if type(direct) == "table" then
+        return direct, resolveNode({ "Controllers", "CameraController" })
+    end
+
+    local root = Services.ReplicatedStorage
+    if not root then
+        return nil, "ReplicatedStorage unavailable"
+    end
+
+    local queue = { { node = root, depth = 0 } }
+    local head = 1
+    local budget = SCAN_NODE_BUDGET
+
+    while head <= #queue and budget > 0 do
+        local entry = queue[head]
+        head = head + 1
+        budget = budget - 1
+        local node = entry.node
+        local depth = entry.depth
+
+        if node:IsA("ModuleScript") and string.find(string.lower(node.Name), "camera", 1, true) then
+            local ok, module = pcall(require, node)
+            if ok and type(module) == "table" then
+                return module, node
+            end
+        end
+
+        if depth < SCAN_DEPTH_LIMIT and #queue < SCAN_QUEUE_CEILING then
+            local okChildren, children = pcall(function()
+                return node:GetChildren()
+            end)
+            if okChildren and children then
+                for _, child in ipairs(children) do
+                    queue[#queue + 1] = { node = child, depth = depth + 1 }
+                end
+            end
+        end
+    end
+
+    return nil, "camera controller not located"
+end
+
+-- ============================================================================
+-- 6. NO SPREAD
+-- ============================================================================
+
+local SWEEP_DEPTH = 3
+local SWEEP_WRITE_BUDGET = 5000
+local SWEEP_TIME_CEILING = 0.25
+
+local NoSpread = {
+    enabled = false,
+    mode = "off",
+    upvalues = 0,
+    restores = {},
+    originalRandom = nil,
+    patchedGlobal = false,
+    randomHookOriginal = nil,
+    detour = nil,
+    detourOriginal = nil,
+    detourKind = nil,
+}
+
+-- Deterministic stand-in for math.random.
+--   random()     -> 0.5   midpoint, zero bias in either direction
+--   random(m)    -> 1     spread call sites index a deviation table; index 1 is
+--                         the smallest cone available
+--   random(a, b) -> midpoint, integer-safe, clamped into the passed range
+local function spreadRandom(a, b)
+    if a == nil then
+        return 0.5
+    end
+    if b == nil then
+        if type(a) ~= "number" then
+            return 0.5
+        end
+        return 1
+    end
+    if type(a) ~= "number" or type(b) ~= "number" then
+        return 0.5
+    end
+    local low = math.min(a, b)
+    local high = math.max(a, b)
+    local mid = math.floor((low + high) / 2 + 0.5)
+    return clamp(mid, low, high)
+end
+
+function NoSpread.collectRoots()
+    local roots = {}
+    local weapon = Surface.findWeaponModule()
+    if weapon then
+        roots[#roots + 1] = weapon
+    end
+
+    local extraPaths = {
+        { "Components", "Weapon", "Classes", "Bullet" },
+        { "Shared", "Raycast" },
+        { "Components", "Common", "GetRayIgnore" },
+        { "Controllers", "InventoryController" },
+    }
+
+    for _, path in ipairs(extraPaths) do
+        local module = Surface.requirePath(path)
+        if module ~= nil then
+            roots[#roots + 1] = module
+        end
+    end
+
+    local camera = Surface.findCameraController()
+    if camera ~= nil then
+        roots[#roots + 1] = camera
+    end
+
+    return roots
+end
+
+function NoSpread.sweep(roots)
+    if not EXEC.getUpvalues or not EXEC.setUpvalue then
+        return false
+    end
+
+    local original = NoSpread.originalRandom or math.random
+    local deadline = os.clock() + SWEEP_TIME_CEILING
+    local writes = 0
+
+    for _, root in ipairs(roots) do
+        walkGraph(root, SWEEP_DEPTH, SWEEP_WRITE_BUDGET, function(value, kind)
+            if os.clock() > deadline or writes >= SWEEP_WRITE_BUDGET then
+                return
+            end
+            if kind ~= "function" then
+                return
+            end
+
+            local okList, list = pcall(EXEC.getUpvalues, value)
+            if not okList or type(list) ~= "table" then
+                return
+            end
+
+            for index = 1, #list do
+                if list[index] == original then
+                    local okSet = pcall(EXEC.setUpvalue, value, index, spreadRandom)
+                    if okSet then
+                        NoSpread.restores[#NoSpread.restores + 1] = {
+                            fn = value,
+                            index = index,
+                            original = original,
+                        }
+                        NoSpread.upvalues = NoSpread.upvalues + 1
+                        writes = writes + 1
+                    end
+                end
+            end
+        end)
+    end
+
+    return NoSpread.upvalues > 0
+end
+
+function NoSpread.patchGlobal()
+    if math.random == spreadRandom then
+        NoSpread.patchedGlobal = true
+        return true
+    end
+
+    local original = math.random
+    local ok = writeKey(math, "random", spreadRandom)
+    if ok then
+        NoSpread.originalRandom = original
+        NoSpread.patchedGlobal = true
+        return true
+    end
+
+    return false, "math.random write blocked"
+end
+
+local DIRECTION_KEY_HINTS = {
+    dir = true,
+    direction = true,
+    look = true,
+    lookvector = true,
+    aim = true,
+    spread = true,
+}
+
+local function rewriteDirectionArguments(packed)
+    local workspace = Services.Workspace
+    local camera = workspace and workspace.CurrentCamera
+    if not camera then
+        return false
+    end
+
+    local look = camera.CFrame.LookVector
+    local changed = false
+
+    for index = 1, packed.n do
+        local value = packed[index]
+        local kind = typeof(value)
+
+        if kind == "Vector3" then
+            -- Only unit-length vectors are directions; anything else is a
+            -- position and is passed through untouched.
+            if math.abs(value.Magnitude - 1) < 0.02 then
+                packed[index] = look
+                changed = true
+            end
+        elseif kind == "CFrame" then
+            packed[index] = CFrame.new(value.Position) * CFrame.lookAt(Vector3.zero, look)
+            changed = true
+        elseif kind == "table" then
+            for key, inner in pairs(value) do
+                if type(key) == "string" and DIRECTION_KEY_HINTS[string.lower(key)] then
+                    local innerKind = typeof(inner)
+                    if innerKind == "Vector3" and math.abs(inner.Magnitude - 1) < 0.02 then
+                        value[key] = look
+                        changed = true
+                    elseif innerKind == "CFrame" then
+                        value[key] = CFrame.new(inner.Position) * CFrame.lookAt(Vector3.zero, look)
+                        changed = true
+                    end
+                end
+            end
+        end
+    end
+
+    return changed
+end
+
+local function buildShootDetour(originalCallable)
+    return function(...)
+        local packed = table.pack(...)
+        local okRewrite, rewriteResult = pcall(rewriteDirectionArguments, packed)
+        if not okRewrite then
+            diag("warn", "shoot rewrite raised; calling original untouched: " .. tostring(rewriteResult))
+        end
+
+        local workspace = Services.Workspace
+        local camera = workspace and workspace.CurrentCamera
+        ShotBus.fire(camera and camera.CFrame.LookVector or nil, camera and camera.CFrame or nil)
+
+        return originalCallable(table.unpack(packed, 1, packed.n))
+    end
+end
+
+function NoSpread.installShootDetour()
+    local weapon = Surface.findWeaponModule()
+    if not weapon then
+        return false, "weapon module unavailable"
+    end
+
+    local shoot = weapon.shoot
+    if type(shoot) ~= "function" then
+        return false, "shoot is not callable"
+    end
+
+    if EXEC.hook then
+        -- The detour needs the unhooked clone, and the clone only exists after
+        -- the hook is in place. A single forward-declared slot resolves the
+        -- cycle without a second hook on the same closure.
+        local inner = nil
+        local detour = function(...)
+            local packed = table.pack(...)
+            local okRewrite, rewriteError = pcall(rewriteDirectionArguments, packed)
+            if not okRewrite then
+                diag("warn", "shoot rewrite raised; calling original untouched: " .. tostring(rewriteError))
+            end
+
+            local workspace = Services.Workspace
+            local camera = workspace and workspace.CurrentCamera
+            ShotBus.fire(camera and camera.CFrame.LookVector or nil, camera and camera.CFrame or nil)
+
+            if inner then
+                return inner(table.unpack(packed, 1, packed.n))
+            end
+            return nil
+        end
+
+        local okHook, unhooked = pcall(EXEC.hook, shoot, detour)
+        if okHook and type(unhooked) == "function" then
+            inner = unhooked
+            NoSpread.detour = detour
+            NoSpread.detourOriginal = unhooked
+            NoSpread.detourKind = "hook"
+            ShotBus.sourceKind = "hookfunction"
+            return true
+        end
+    end
+
+    local replacement = buildShootDetour(shoot)
+    local okWrite = writeKey(weapon, "shoot", replacement)
+    if okWrite then
+        NoSpread.detour = replacement
+        NoSpread.detourOriginal = shoot
+        NoSpread.detourKind = "table"
+        ShotBus.sourceKind = "table-write"
+        return true
+    end
+
+    return false, "neither hookfunction nor a writable module table is available"
+end
+
+function NoSpread.installRandomHook()
+    if not EXEC.hook then
+        return false, "hookfunction unavailable"
+    end
+    local okHook, unhooked = pcall(EXEC.hook, math.random, spreadRandom)
+    if okHook and type(unhooked) == "function" then
+        NoSpread.randomHookOriginal = unhooked
+        return true
+    end
+    return false, "math.random hook refused"
+end
+
+function NoSpread.enable()
+    if NoSpread.enabled then
+        return true
+    end
+
+    if not NoSpread.originalRandom and math.random ~= spreadRandom then
+        NoSpread.originalRandom = math.random
+    end
+
+    local roots = NoSpread.collectRoots()
+    local layerUpvalue = NoSpread.sweep(roots)
+    local layerGlobal = NoSpread.patchGlobal()
+    local layerShoot, shootError = NoSpread.installShootDetour()
+    local layerHook = false
+
+    if not layerUpvalue then
+        layerHook = NoSpread.installRandomHook()
+    end
+
+    local parts = {}
+    if layerShoot then
+        parts[#parts + 1] = "shoot"
+    end
+    if layerUpvalue then
+        parts[#parts + 1] = "up" .. tostring(NoSpread.upvalues)
+    end
+    if layerGlobal then
+        parts[#parts + 1] = "global"
+    end
+    if layerHook then
+        parts[#parts + 1] = "hookonly"
+    end
+
+    if #parts == 0 then
+        NoSpread.mode = "none"
+        diag("error", "no spread: no layer installed (" .. tostring(shootError) .. ")")
+        return false, "no layer installed"
+    end
+
+    NoSpread.mode = table.concat(parts, "+")
+    NoSpread.enabled = true
+    diag("info", "no spread installed: " .. NoSpread.mode)
+    return true
+end
+
+function NoSpread.restoreShootDetour()
+    if NoSpread.detourKind == "hook" and EXEC.hook and NoSpread.detour and NoSpread.detourOriginal then
+        -- Restoring a detour in this API is a re-hook: pointing the detour
+        -- closure back at the original clone makes the hooked closure execute
+        -- the original body again.
+        safeCall("noSpread/unhook", EXEC.hook, NoSpread.detour, NoSpread.detourOriginal)
+    elseif NoSpread.detourKind == "table" then
+        local weapon = Surface.findWeaponModule()
+        if weapon and NoSpread.detourOriginal then
+            writeKey(weapon, "shoot", NoSpread.detourOriginal)
+        end
+    end
+
+    NoSpread.detour = nil
+    NoSpread.detourOriginal = nil
+    NoSpread.detourKind = nil
+    ShotBus.sourceKind = nil
+end
+
+function NoSpread.disable()
+    for index = #NoSpread.restores, 1, -1 do
+        local entry = NoSpread.restores[index]
+        if EXEC.setUpvalue then
+            safeCall("noSpread/restoreUpvalue", EXEC.setUpvalue, entry.fn, entry.index, entry.original)
+        end
+    end
+    table.clear(NoSpread.restores)
+    NoSpread.upvalues = 0
+
+    if NoSpread.patchedGlobal and NoSpread.originalRandom then
+        writeKey(math, "random", NoSpread.originalRandom)
+        NoSpread.patchedGlobal = false
+    end
+
+    if NoSpread.randomHookOriginal and EXEC.hook then
+        safeCall("noSpread/unhookRandom", EXEC.hook, spreadRandom, NoSpread.randomHookOriginal)
+        NoSpread.randomHookOriginal = nil
+    end
+
+    NoSpread.restoreShootDetour()
+    NoSpread.enabled = false
+    NoSpread.mode = "off"
+    diag("info", "no spread disabled")
+end
+
+function NoSpread.status()
+    return NoSpread.mode
+end
+
+-- ============================================================================
+-- 7. NO RECOIL
+-- ============================================================================
+
+local CORRECTION_FRAMES = 4
+local RECOIL_FIELD_LIMIT = 32
+local RECOIL_KEYWORDS = {
+    "recoil",
+    "punch",
+    "kick",
+    "camrecoil",
+    "shotsomething",
+    "sway",
+}
+
+local NoRecoil = {
+    enabled = false,
+    method = "auto",
+    active = {},
+    fieldRestores = {},
+    upvalueRestores = {},
+    visual = { active = false, snapshot = nil, frames = 0, unsubscribe = nil },
+    renderConnection = nil,
+}
+
+local function matchesRecoilName(name)
+    if type(name) ~= "string" then
+        return false
+    end
+    local lowered = string.lower(name)
+    for _, keyword in ipairs(RECOIL_KEYWORDS) do
+        if string.find(lowered, keyword, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function zeroRecoilFields(root, limit)
+    local found = 0
+    walkGraph(root, 3, 4000, function(value, kind)
+        if kind ~= "table" or found >= limit then
+            return
+        end
+        for key, field in pairs(value) do
+            if found >= limit then
+                return
+            end
+            if type(key) == "string" and type(field) == "number" and field ~= 0 then
+                if matchesRecoilName(key) then
+                    local ok = writeKey(value, key, 0)
+                    if ok then
+                        NoRecoil.fieldRestores[#NoRecoil.fieldRestores + 1] = {
+                            table = value,
+                            key = key,
+                            original = field,
+                        }
+                        found = found + 1
+                    end
+                end
+            end
+        end
+    end)
+    return found
+end
+
+local function zeroRecoilUpvalues(roots)
+    if not EXEC.getUpvalues or not EXEC.setUpvalue or not EXEC.getUpvalueName then
+        return 0
+    end
+
+    local found = 0
+    for _, root in ipairs(roots) do
+        walkGraph(root, 3, 2000, function(value, kind)
+            if kind ~= "function" or found >= RECOIL_FIELD_LIMIT then
+                return
+            end
+
+            local okList, list = pcall(EXEC.getUpvalues, value)
+            if not okList or type(list) ~= "table" then
+                return
+            end
+
+            for index = 1, #list do
+                local current = list[index]
+                if type(current) == "number" and current ~= 0 then
+                    local okName, name = pcall(EXEC.getUpvalueName, value, index)
+                    if okName and matchesRecoilName(name) then
+                        local okSet = pcall(EXEC.setUpvalue, value, index, 0)
+                        if okSet then
+                            NoRecoil.upvalueRestores[#NoRecoil.upvalueRestores + 1] = {
+                                fn = value,
+                                index = index,
+                                original = current,
+                            }
+                            found = found + 1
+                        end
+                    end
+                end
+            end
+        end)
+    end
+    return found
+end
+
+function NoRecoil.zeroCamera()
+    local cameraModule = Surface.findCameraController()
+    if cameraModule == nil then
+        return 0, "camera controller not located"
+    end
+
+    local found = zeroRecoilFields(cameraModule, RECOIL_FIELD_LIMIT)
+    found = found + zeroRecoilUpvalues({ cameraModule })
+
+    if found == 0 then
+        return 0, "no recoil-named numeric field in the camera module"
+    end
+
+    return found
+end
+
+function NoRecoil.zeroWeaponStats()
+    local inventory = Surface.requirePath({ "Controllers", "InventoryController" })
+    local weapon = Surface.findWeaponModule()
+    local roots = { inventory, weapon }
+    local found = 0
+
+    for _, root in ipairs(roots) do
+        if root ~= nil then
+            found = found + zeroRecoilFields(root, RECOIL_FIELD_LIMIT - found)
+        end
+    end
+
+    if found == 0 then
+        return 0, "no recoil-named numeric field in the weapon definition"
+    end
+
+    return found
+end
+
+function NoRecoil.onShot()
+    local visual = NoRecoil.visual
+    if not visual.active or isCharacterDead() then
+        return
+    end
+
+    local workspace = Services.Workspace
+    local camera = workspace and workspace.CurrentCamera
+    if not camera then
+        return
+    end
+    if camera.CameraType == Enum.CameraType.Scriptable then
+        return
+    end
+
+    visual.snapshot = camera.CFrame
+    visual.frames = CORRECTION_FRAMES
+end
+
+function NoRecoil.onRenderStep()
+    local visual = NoRecoil.visual
+    if not visual.active or not visual.snapshot or visual.frames <= 0 then
+        return
+    end
+
+    local workspace = Services.Workspace
+    local camera = workspace and workspace.CurrentCamera
+    if not camera then
+        visual.frames = 0
+        return
+    end
+    if camera.CameraType == Enum.CameraType.Scriptable or isCharacterDead() then
+        visual.frames = 0
+        return
+    end
+
+    visual.frames = visual.frames - 1
+
+    local current = camera.CFrame
+    local currentRotation = current - current.Position
+    local goalRotation = visual.snapshot - visual.snapshot.Position
+    local alpha = 1 / (visual.frames + 1)
+    local blended = currentRotation:Lerp(goalRotation, alpha)
+
+    -- Rotation only: writing the position fights the game's camera spring and
+    -- turns the correction into a visible tug-of-war.
+    camera.CFrame = CFrame.new(current.Position) * blended
+end
+
+function NoRecoil.installVisual()
+    if ShotBus.sourceKind == nil then
+        return false, "shot detection unavailable (shoot detour not installed)"
+    end
+    if not Services.RunService then
+        return false, "RunService unavailable"
+    end
+
+    NoRecoil.visual.active = true
+    NoRecoil.visual.unsubscribe = ShotBus.subscribe(function()
+        NoRecoil.onShot()
+    end)
+
+    if not NoRecoil.renderConnection then
+        NoRecoil.renderConnection = connect(Services.RunService.RenderStepped, function()
+            NoRecoil.onRenderStep()
+        end)
+    end
+
+    if not NoRecoil.renderConnection then
+        NoRecoil.visual.active = false
+        if NoRecoil.visual.unsubscribe then
+            NoRecoil.visual.unsubscribe()
+            NoRecoil.visual.unsubscribe = nil
+        end
+        return false, "RenderStepped connection refused"
+    end
+
+    return true
+end
+
+function NoRecoil.enable(method)
+    if NoRecoil.enabled then
+        return true
+    end
+
+    method = method or NoRecoil.method or "auto"
+    NoRecoil.method = method
+
+    local wantCamera = method == "auto" or method == "camera"
+    local wantStats = method == "auto" or method == "stats"
+    local wantVisual = method == "auto" or method == "visual"
+    local reasons = {}
+
+    if wantCamera then
+        local count, reason = NoRecoil.zeroCamera()
+        if count > 0 then
+            NoRecoil.active.camera = count
+            diag("info", string.format("no recoil: camera mechanism zeroed %d field(s)", count))
+        elseif reason then
+            reasons[#reasons + 1] = reason
+        end
+    end
+
+    if wantStats then
+        local count, reason = NoRecoil.zeroWeaponStats()
+        if count > 0 then
+            NoRecoil.active.stats = count
+            diag("info", string.format("no recoil: weapon stats zeroed %d field(s)", count))
+        elseif reason then
+            reasons[#reasons + 1] = reason
+        end
+    end
+
+    if wantVisual and (method == "visual" or not (NoRecoil.active.camera or NoRecoil.active.stats)) then
+        local okVisual, reason = NoRecoil.installVisual()
+        if okVisual then
+            NoRecoil.active.visual = CORRECTION_FRAMES
+            diag("info", "no recoil: visual correction active (cosmetic, not a root-cause fix)")
+        else
+            reasons[#reasons + 1] = tostring(reason)
+        end
+    end
+
+    if not (NoRecoil.active.camera or NoRecoil.active.stats or NoRecoil.active.visual) then
+        diag("error", "no recoil: no mechanism resolved (" .. table.concat(reasons, "; ") .. ")")
+        return false, "no mechanism resolved"
+    end
+
+    NoRecoil.enabled = true
+    return true
+end
+
+function NoRecoil.disable()
+    for index = #NoRecoil.fieldRestores, 1, -1 do
+        local entry = NoRecoil.fieldRestores[index]
+        writeKey(entry.table, entry.key, entry.original)
+    end
+    table.clear(NoRecoil.fieldRestores)
+
+    for index = #NoRecoil.upvalueRestores, 1, -1 do
+        local entry = NoRecoil.upvalueRestores[index]
+        if EXEC.setUpvalue then
+            safeCall("noRecoil/restoreUpvalue", EXEC.setUpvalue, entry.fn, entry.index, entry.original)
+        end
+    end
+    table.clear(NoRecoil.upvalueRestores)
+
+    if NoRecoil.visual.unsubscribe then
+        NoRecoil.visual.unsubscribe()
+        NoRecoil.visual.unsubscribe = nil
+    end
+    NoRecoil.visual.active = false
+    NoRecoil.visual.snapshot = nil
+    NoRecoil.visual.frames = 0
+
+    dropConnection(NoRecoil.renderConnection)
+    NoRecoil.renderConnection = nil
+
+    table.clear(NoRecoil.active)
+    NoRecoil.enabled = false
+    diag("info", "no recoil disabled")
+end
+
+function NoRecoil.status()
+    local parts = {}
+    for key in pairs(NoRecoil.active) do
+        parts[#parts + 1] = key
+    end
+    table.sort(parts)
+    if #parts == 0 then
+        return "off"
+    end
+    return table.concat(parts, "+")
+end
+
+-- ============================================================================
+-- 8. CONFIG MODULE
+-- ============================================================================
+
+local Config = {}
+
+local CONFIG_FOLDER = "pena"
+local CONFIG_FILE = "pena/config.json"
+local RECOIL_METHODS = { "auto", "camera", "stats", "visual" }
+
+local DEFAULTS = {
+    noSpread = true,
+    noRecoil = true,
+    recoilMethod = "auto",
+    keybind = "Insert",
+    windowX = 40,
+    windowY = 80,
+    collapsed = false,
+    diagnosticsOpen = true,
+}
+
+Config.values = {}
+for key, value in pairs(DEFAULTS) do
+    Config.values[key] = value
+end
+
+local function isRecoilMethod(value)
+    if type(value) ~= "string" then
+        return false
+    end
+    for _, method in ipairs(RECOIL_METHODS) do
+        if method == value then
+            return true
+        end
+    end
+    return false
+end
+
+function Config.validate(source)
+    local validated = {}
+    for key, fallback in pairs(DEFAULTS) do
+        validated[key] = fallback
+    end
+
+    if type(source) ~= "table" then
+        return validated
+    end
+
+    if type(source.noSpread) == "boolean" then
+        validated.noSpread = source.noSpread
+    end
+    if type(source.noRecoil) == "boolean" then
+        validated.noRecoil = source.noRecoil
+    end
+    if isRecoilMethod(source.recoilMethod) then
+        validated.recoilMethod = source.recoilMethod
+    end
+    if type(source.keybind) == "string" and Enum.KeyCode[source.keybind] then
+        validated.keybind = source.keybind
+    end
+    if type(source.windowX) == "number" then
+        validated.windowX = clamp(round(source.windowX), 0, 4096)
+    end
+    if type(source.windowY) == "number" then
+        validated.windowY = clamp(round(source.windowY), 0, 4096)
+    end
+    if type(source.collapsed) == "boolean" then
+        validated.collapsed = source.collapsed
+    end
+    if type(source.diagnosticsOpen) == "boolean" then
+        validated.diagnosticsOpen = source.diagnosticsOpen
+    end
+
+    return validated
+end
+
+function Config.persistenceAvailable()
+    return EXEC.writeFile ~= nil and EXEC.readFile ~= nil
+end
+
+function Config.save()
+    if not Config.persistenceAvailable() or not Services.HttpService then
+        return false, "persistence unavailable"
+    end
+
+    if EXEC.isFolder and EXEC.makeFolder then
+        local okFolder, exists = pcall(EXEC.isFolder, CONFIG_FOLDER)
+        if not okFolder or not exists then
+            safeCall("config/makeFolder", EXEC.makeFolder, CONFIG_FOLDER)
+        end
+    elseif EXEC.makeFolder then
+        safeCall("config/makeFolder", EXEC.makeFolder, CONFIG_FOLDER)
+    end
+
+    local okEncode, encoded = pcall(function()
+        return Services.HttpService:JSONEncode(Config.values)
+    end)
+    if not okEncode or type(encoded) ~= "string" then
+        diag("error", "config encode failed: " .. tostring(encoded))
+        return false, "encode failed"
+    end
+
+    local okWrite = safeCall("config/writeFile", EXEC.writeFile, CONFIG_FILE, encoded)
+    if not okWrite then
+        return false, "write failed"
+    end
+
+    diag("info", "config saved to " .. CONFIG_FILE)
+    return true
+end
+
+function Config.load()
+    if not Config.persistenceAvailable() or not Services.HttpService then
+        return false, "persistence unavailable"
+    end
+
+    if EXEC.isFile then
+        local okExists, exists = pcall(EXEC.isFile, CONFIG_FILE)
+        if not okExists or not exists then
+            return false, "no config file"
+        end
+    end
+
+    local okRead, contents = pcall(EXEC.readFile, CONFIG_FILE)
+    if not okRead or type(contents) ~= "string" or contents == "" then
+        diag("warn", "config read failed; using defaults")
+        return false, "read failed"
+    end
+
+    local okDecode, decoded = pcall(function()
+        return Services.HttpService:JSONDecode(contents)
+    end)
+    if not okDecode then
+        diag("warn", "config decode failed; using defaults")
+        return false, "decode failed"
+    end
+
+    local validated = Config.validate(decoded)
+    for key, value in pairs(validated) do
+        Config.values[key] = value
+    end
+
+    diag("info", "config loaded from " .. CONFIG_FILE)
+    return true
+end
+
+function Config.get(key)
+    return Config.values[key]
+end
+
+function Config.set(key, value)
+    if DEFAULTS[key] == nil then
+        return false
+    end
+    Config.values[key] = value
+    return true
+end
+
+-- ============================================================================
+-- 9. DIAGNOSTICS MODULE
+-- ============================================================================
+
+local DIAG_CAPACITY = 48
+
+Diag = {
+    events = {},
+}
+
+function Diag.push(level, text)
+    local entry = {
+        level = tostring(level),
+        text = tostring(text),
+        time = os.clock(),
+    }
+
+    local events = Diag.events
+    events[#events + 1] = entry
+    if #events > DIAG_CAPACITY then
+        table.remove(events, 1)
+    end
+
+    return entry
+end
+
+function Diag.snapshot(tailCount)
+    local events = Diag.events
+    local total = #events
+    local wanted = tailCount or total
+    local start = math.max(1, total - wanted + 1)
+    local lines = {}
+
+    for index = start, total do
+        local entry = events[index]
+        lines[#lines + 1] = string.format("%6.2fs  %-5s %s", entry.time, entry.level, entry.text)
+    end
+
+    return lines
+end
+
+function Diag.clear()
+    table.clear(Diag.events)
+end
+
+-- ============================================================================
+-- 10. GUI LAYER
+-- ============================================================================
+
+local Theme = {
+    background = Color3.fromRGB(18, 18, 20),
+    backgroundTransparency = 0.08,
+    surface = Color3.fromRGB(26, 26, 30),
+    surfaceHover = Color3.fromRGB(34, 34, 40),
+    surfacePress = Color3.fromRGB(44, 44, 52),
+    panel = Color3.fromRGB(14, 14, 16),
+    border = Color3.fromRGB(52, 52, 60),
+    accent = Color3.fromRGB(104, 170, 255),
+    accentDim = Color3.fromRGB(48, 78, 116),
+    accentText = Color3.fromRGB(12, 16, 22),
+    text = Color3.fromRGB(234, 234, 238),
+    textDim = Color3.fromRGB(146, 146, 156),
+    font = Enum.Font.GothamMedium,
+    fontBold = Enum.Font.GothamBold,
+    fontMono = Enum.Font.Code,
+    textSize = 12,
+    textSizeSmall = 11,
+    rowHeight = 26,
+    buttonHeight = 24,
+    padding = 8,
+    gap = 4,
+    corner = 4,
+    borderThickness = 1,
+    tweenTime = 0.15,
+    windowWidth = 244,
+    titleHeight = 28,
+    diagnosticsHeight = 108,
+}
+
+local Gui = {
+    screenGui = nil,
+    window = nil,
+    titleBar = nil,
+    body = nil,
+    diagnosticsFrame = nil,
+    diagnosticsLabel = nil,
+    widgets = {},
+    awaitingKeybind = false,
+    dragging = false,
+    dragStart = nil,
+    dragOrigin = nil,
+    hidden = false,
+}
+
+local function newInstance(className, properties, parent)
+    local ok, instance = pcall(Instance.new, className)
+    if not ok or not instance then
+        diag("error", "Instance.new failed for " .. tostring(className))
+        return nil
+    end
+
+    for key, value in pairs(properties) do
+        local okSet = pcall(function()
+            instance[key] = value
+        end)
+        if not okSet then
+            diag("warn", string.format("property %s rejected on %s", tostring(key), tostring(className)))
+        end
+    end
+
+    if parent then
+        instance.Parent = parent
+    end
+
+    Gui.widgets[#Gui.widgets + 1] = instance
+    return instance
+end
+
+local function tween(instance, duration, properties)
+    local tweenService = Services.TweenService
+    if not tweenService then
+        for key, value in pairs(properties) do
+            safeCall("tween/set", function()
+                instance[key] = value
+            end)
+        end
+        return
+    end
+
+    local info = TweenInfo.new(duration or Theme.tweenTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local ok, animation = pcall(function()
+        return tweenService:Create(instance, info, properties)
+    end)
+    if ok and animation then
+        safeCall("tween/play", function()
+            animation:Play()
+        end)
+    end
+end
+
+local function paintInteractive(button, baseColor, hoverColor, pressColor)
+    connect(button.MouseEnter, function()
+        tween(button, Theme.tweenTime, { BackgroundColor3 = hoverColor })
+    end)
+    connect(button.MouseLeave, function()
+        tween(button, Theme.tweenTime, { BackgroundColor3 = baseColor })
+    end)
+    connect(button.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            button.BackgroundColor3 = pressColor
+        end
+    end)
+    connect(button.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            tween(button, Theme.tweenTime, { BackgroundColor3 = hoverColor })
+        end
+    end)
+end
+
+local function makeToggle(parent, labelText, initialValue, onChanged)
+    local row = newInstance("TextButton", {
+        Name = "Toggle_" .. tostring(labelText),
+        BackgroundColor3 = Theme.surface,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, Theme.rowHeight),
+        Text = "",
+    }, parent)
+
+    if not row then
+        return { set = function() end, get = function() return false end, destroy = function() end }
+    end
+
+    newInstance("UICorner", { CornerRadius = UDim.new(0, Theme.corner) }, row)
+    newInstance("UIStroke", {
+        Color = Theme.border,
+        Thickness = Theme.borderThickness,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Transparency = 0.45,
+    }, row)
+
+    local label = newInstance("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(Theme.padding, 0),
+        Size = UDim2.new(1, -(Theme.padding * 2) - 34, 1, 0),
+        Font = Theme.font,
+        Text = labelText,
+        TextColor3 = Theme.text,
+        TextSize = Theme.textSize,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+
+    local track = newInstance("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -Theme.padding, 0.5, 0),
+        Size = UDim2.fromOffset(28, 14),
+        BackgroundColor3 = Theme.accentDim,
+        BorderSizePixel = 0,
+    }, row)
+
+    if track then
+        newInstance("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+    end
+
+    local knob = newInstance("Frame", {
+        Position = UDim2.fromOffset(2, 2),
+        Size = UDim2.fromOffset(10, 10),
+        BackgroundColor3 = Theme.textDim,
+        BorderSizePixel = 0,
+    }, track)
+
+    if knob then
+        newInstance("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+    end
+
+    local state = initialValue == true
+
+    local function paint()
+        if track then
+            track.BackgroundColor3 = state and Theme.accent or Theme.accentDim
+        end
+        if knob then
+            knob.BackgroundColor3 = state and Theme.accentText or Theme.textDim
+            tween(knob, Theme.tweenTime, {
+                Position = state and UDim2.fromOffset(16, 2) or UDim2.fromOffset(2, 2),
+            })
+        end
+        if label then
+            label.TextColor3 = state and Theme.text or Theme.textDim
+        end
+    end
+
+    local handle = {}
+
+    function handle.get()
+        return state
+    end
+
+    function handle.set(value, silent)
+        local nextState = value == true
+        if nextState == state then
+            paint()
+            return
+        end
+        state = nextState
+        paint()
+        if not silent and onChanged then
+            local okCall, err = pcall(onChanged, state)
+            if not okCall then
+                diag("error", "toggle handler failed: " .. tostring(err))
+            end
+        end
+    end
+
+    function handle.destroy()
+        if row then
+            row:Destroy()
+            row = nil
+        end
+    end
+
+    paint()
+    paintInteractive(row, Theme.surface, Theme.surfaceHover, Theme.surfacePress)
+    connect(row.MouseButton1Click, function()
+        handle.set(not state)
+    end)
+
+    return handle
+end
+
+local function makeButton(parent, labelText, callback)
+    local button = newInstance("TextButton", {
+        Name = "Button_" .. tostring(labelText),
+        BackgroundColor3 = Theme.surface,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, Theme.buttonHeight),
+        Font = Theme.font,
+        Text = labelText,
+        TextColor3 = Theme.text,
+        TextSize = Theme.textSize,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, parent)
+
+    if not button then
+        return { set = function() end, get = function() return "" end, destroy = function() end }
+    end
+
+    newInstance("UICorner", { CornerRadius = UDim.new(0, Theme.corner) }, button)
+    newInstance("UIStroke", {
+        Color = Theme.border,
+        Thickness = Theme.borderThickness,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Transparency = 0.45,
+    }, button)
+
+    local handle = {}
+
+    function handle.set(value)
+        if button then
+            button.Text = tostring(value)
+        end
+    end
+
+    function handle.get()
+        if button then
+            return button.Text
+        end
+        return ""
+    end
+
+    function handle.destroy()
+        if button then
+            button:Destroy()
+            button = nil
+        end
+    end
+
+    paintInteractive(button, Theme.surface, Theme.surfaceHover, Theme.surfacePress)
+
+    connect(button.MouseButton1Click, function()
+        if not callback then
+            return
+        end
+        local okCall, err = pcall(callback)
+        if not okCall then
+            diag("error", "button handler failed: " .. tostring(err))
+        end
+    end)
+
+    return handle
+end
+
+local function makeSelector(parent, labelText, options, initialValue, onChanged)
+    local row = newInstance("TextButton", {
+        Name = "Selector_" .. tostring(labelText),
+        BackgroundColor3 = Theme.surface,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, Theme.rowHeight),
+        Text = "",
+    }, parent)
+
+    if not row then
+        return {
+            set = function() end,
+            get = function() return initialValue end,
+            cycle = function() end,
+            destroy = function() end,
+        }
+    end
+
+    newInstance("UICorner", { CornerRadius = UDim.new(0, Theme.corner) }, row)
+    newInstance("UIStroke", {
+        Color = Theme.border,
+        Thickness = Theme.borderThickness,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Transparency = 0.45,
+    }, row)
+
+    newInstance("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(Theme.padding, 0),
+        Size = UDim2.new(0.5, -Theme.padding, 1, 0),
+        Font = Theme.font,
+        Text = labelText,
+        TextColor3 = Theme.text,
+        TextSize = Theme.textSize,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+
+    local valueLabel = newInstance("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundTransparency = 1,
+        Position = UDim2.new(1, -Theme.padding, 0.5, 0),
+        Size = UDim2.new(0.5, -Theme.padding, 1, 0),
+        Font = Theme.fontBold,
+        Text = tostring(initialValue or ""),
+        TextColor3 = Theme.accent,
+        TextSize = Theme.textSize,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+
+    local index = 1
+    for position, option in ipairs(options) do
+        if option == initialValue then
+            index = position
+            break
+        end
+    end
+
+    local handle = {}
+
+    function handle.get()
+        return options[index]
+    end
+
+    function handle.set(value, silent)
+        for position, option in ipairs(options) do
+            if option == value then
+                index = position
+                break
+            end
+        end
+        if valueLabel then
+            valueLabel.Text = tostring(options[index])
+        end
+        if not silent and onChanged then
+            local okCall, err = pcall(onChanged, options[index])
+            if not okCall then
+                diag("error", "selector handler failed: " .. tostring(err))
+            end
+        end
+    end
+
+    function handle.cycle()
+        index = index + 1
+        if index > #options then
+            index = 1
+        end
+        handle.set(options[index])
+    end
+
+    function handle.destroy()
+        if row then
+            row:Destroy()
+            row = nil
+        end
+    end
+
+    paintInteractive(row, Theme.surface, Theme.surfaceHover, Theme.surfacePress)
+    connect(row.MouseButton1Click, function()
+        handle.cycle()
+    end)
+
+    return handle
+end
+
+local function viewportSize()
+    local workspace = Services.Workspace
+    local camera = workspace and workspace.CurrentCamera
+    if camera then
+        return camera.ViewportSize
+    end
+    return Vector2.new(1280, 720)
+end
+
+local function clampWindowPosition(offsetX, offsetY)
+    local window = Gui.window
+    if not window then
+        return UDim2.fromOffset(offsetX, offsetY)
+    end
+
+    local size = window.AbsoluteSize
+    local viewport = viewportSize()
+    local maxX = math.max(0, viewport.X - size.X)
+    local maxY = math.max(0, viewport.Y - size.Y)
+
+    return UDim2.fromOffset(clamp(offsetX, 0, maxX), clamp(offsetY, 0, maxY))
+end
+
+local function applyStoredPosition()
+    local window = Gui.window
+    if not window then
+        return
+    end
+    local storedX = Config.get("windowX") or 40
+    local storedY = Config.get("windowY") or 80
+    window.Position = clampWindowPosition(storedX, storedY)
+end
+
+local function parentForGui()
+    local coreGui = Services.CoreGui
+    if coreGui then
+        local ok, writable = pcall(function()
+            local probe = Instance.new("Folder")
+            probe.Name = "penaProbe"
+            probe.Parent = coreGui
+            probe:Destroy()
+            return true
+        end)
+        if ok and writable then
+            return coreGui
+        end
+        diag("warn", "CoreGui is not writable here; falling back to PlayerGui")
+    end
+
+    local players = Services.Players
+    local player = players and players.LocalPlayer
+    if player then
+        local okGui, playerGui = pcall(function()
+            return player:FindFirstChildOfClass("PlayerGui")
+        end)
+        if okGui and playerGui then
+            return playerGui
+        end
+    end
+
+    return nil
+end
+
+local unload
+
+local function refreshDiagnosticsText()
+    local label = Gui.diagnosticsLabel
+    if not label then
+        return
+    end
+
+    local header = {
+        "exec  : " .. (EXEC.identify and "available" or "unknown"),
+        "spread: " .. NoSpread.status(),
+        "recoil: " .. NoRecoil.status(),
+    }
+
+    local lines = Diag.snapshot(6)
+    local buffer = table.concat(header, "\n")
+
+    if #lines > 0 then
+        buffer = buffer .. "\n" .. table.concat(lines, "\n")
+    else
+        buffer = buffer .. "\n(no events yet)"
+    end
+
+    label.Text = buffer
+end
+
+local function makeDiagnosticsPanel(parent)
+    local frame = newInstance("Frame", {
+        BackgroundColor3 = Theme.panel,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Size = UDim2.new(1, 0, 0, Theme.diagnosticsHeight),
+        Visible = Config.get("diagnosticsOpen") == true,
+    }, parent)
+
+    if not frame then
+        return nil
+    end
+
+    newInstance("UICorner", { CornerRadius = UDim.new(0, Theme.corner) }, frame)
+    newInstance("UIStroke", {
+        Color = Theme.border,
+        Thickness = Theme.borderThickness,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Transparency = 0.7,
+    }, frame)
+
+    local scroll = newInstance("ScrollingFrame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(Theme.padding, Theme.gap),
+        Size = UDim2.new(1, -(Theme.padding * 2), 1, -(Theme.gap * 2)),
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = Theme.border,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+    }, frame)
+
+    local label = newInstance("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        Font = Theme.fontMono,
+        Text = "diagnostics",
+        TextColor3 = Theme.textDim,
+        TextSize = Theme.textSizeSmall,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+    }, scroll)
+
+    Gui.diagnosticsFrame = frame
+    Gui.diagnosticsLabel = label
+
+    return frame
+end
+
+local function currentKeyCode()
+    local name = Config.get("keybind") or "Insert"
+    local keyCode = Enum.KeyCode[name]
+    if keyCode then
+        return keyCode
+    end
+    return Enum.KeyCode.Insert
+end
+
+local function setCollapsed(collapsed)
+    Gui.body.Visible = not collapsed
+    Config.set("collapsed", collapsed)
+    if Gui.chevron then
+        Gui.chevron.Text = collapsed and "+" or "-"
+    end
+end
+
+local function buildWindow()
+    local parent = parentForGui()
+    if not parent then
+        diag("error", "no GUI parent available; window cannot be created")
+        return false
+    end
+
+    local executorName = "unknown"
+    if EXEC.identify then
+        local okIdentify, name = pcall(EXEC.identify)
+        if okIdentify and type(name) == "string" and name ~= "" then
+            executorName = name
+        end
+    end
+
+    local screenGui = newInstance("ScreenGui", {
+        Name = "pena",
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        DisplayOrder = 999,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    }, parent)
+
+    if not screenGui then
+        return false
+    end
+    Gui.screenGui = screenGui
+
+    local window = newInstance("Frame", {
+        Name = "Window",
+        BackgroundColor3 = Theme.background,
+        BackgroundTransparency = Theme.backgroundTransparency,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Active = true,
+        Size = UDim2.fromOffset(Theme.windowWidth, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        Position = UDim2.fromOffset(Config.get("windowX"), Config.get("windowY")),
+    }, screenGui)
+
+    if not window then
+        return false
+    end
+    Gui.window = window
+
+    newInstance("UICorner", { CornerRadius = UDim.new(0, 6) }, window)
+    newInstance("UIStroke", {
+        Color = Theme.border,
+        Thickness = Theme.borderThickness,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Transparency = 0.2,
+    }, window)
+
+    local titleBar = newInstance("TextButton", {
+        Name = "TitleBar",
+        BackgroundColor3 = Theme.surface,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, Theme.titleHeight),
+        Text = "",
+    }, window)
+    Gui.titleBar = titleBar
+
+    if not titleBar then
+        diag("error", "title bar could not be created")
+        return false
+    end
+
+    newInstance("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(Theme.padding, 0),
+        Size = UDim2.new(0.6, -Theme.padding, 1, 0),
+        Font = Theme.fontBold,
+        Text = "pena // spread+recoil",
+        TextColor3 = Theme.text,
+        TextSize = Theme.textSize,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, titleBar)
+
+    newInstance("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundTransparency = 1,
+        Position = UDim2.new(1, -50, 0.5, 0),
+        Size = UDim2.new(0.4, -8, 1, 0),
+        Font = Theme.font,
+        Text = executorName,
+        TextColor3 = Theme.textDim,
+        TextSize = Theme.textSizeSmall,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, titleBar)
+
+    Gui.chevron = newInstance("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -26, 0.5, 0),
+        Size = UDim2.fromOffset(18, 18),
+        BackgroundColor3 = Theme.surface,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        Font = Theme.fontBold,
+        Text = "-",
+        TextColor3 = Theme.textDim,
+        TextSize = Theme.textSize,
+    }, titleBar)
+
+    newInstance("TextButton", {
+        Name = "Close",
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -4, 0.5, 0),
+        Size = UDim2.fromOffset(18, 18),
+        BackgroundColor3 = Theme.surface,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        Font = Theme.fontBold,
+        Text = "x",
+        TextColor3 = Theme.textDim,
+        TextSize = Theme.textSize,
+    }, titleBar)
+
+    local body = newInstance("Frame", {
+        Name = "Body",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+    }, window)
+    Gui.body = body
+
+    newInstance("UIPadding", {
+        PaddingTop = UDim.new(0, Theme.padding),
+        PaddingBottom = UDim.new(0, Theme.padding),
+        PaddingLeft = UDim.new(0, Theme.padding),
+        PaddingRight = UDim.new(0, Theme.padding),
+    }, body)
+
+    newInstance("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, Theme.gap),
+    }, body)
+
+    local toggleSpread = makeToggle(body, "No Spread", Config.get("noSpread"), function(state)
+        Config.set("noSpread", state)
+        if state then
+            NoSpread.enable()
+        else
+            NoSpread.disable()
+        end
+        refreshDiagnosticsText()
+    end)
+
+    local toggleRecoil = makeToggle(body, "No Recoil", Config.get("noRecoil"), function(state)
+        Config.set("noRecoil", state)
+        if state then
+            NoRecoil.enable(Config.get("recoilMethod"))
+        else
+            NoRecoil.disable()
+        end
+        refreshDiagnosticsText()
+    end)
+
+    local selectorMethod = makeSelector(body, "Recoil method", RECOIL_METHODS, Config.get("recoilMethod"), function(value)
+        Config.set("recoilMethod", value)
+        NoRecoil.method = value
+        if NoRecoil.enabled then
+            NoRecoil.disable()
+            NoRecoil.enable(value)
+        end
+        refreshDiagnosticsText()
+    end)
+    Gui.selectorMethod = selectorMethod
+
+    local keybindButton = makeButton(body, "Keybind: " .. tostring(Config.get("keybind")), function()
+        Gui.awaitingKeybind = true
+        keybindButton.set("Keybind: press a key")
+    end)
+    Gui.keybindButton = keybindButton
+
+    local diagButton = makeButton(body, "Diagnostics", function()
+        local frame = Gui.diagnosticsFrame
+        if not frame then
+            return
+        end
+        frame.Visible = not frame.Visible
+        Config.set("diagnosticsOpen", frame.Visible)
+    end)
+    Gui.diagButton = diagButton
+
+    local actionRow = newInstance("Frame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, Theme.buttonHeight),
+    }, body)
+
+    newInstance("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, Theme.gap),
+    }, actionRow)
+
+    local saveButton = makeButton(actionRow, "Save", function()
+        Config.save()
+        refreshDiagnosticsText()
+    end)
+    saveButton.set(Config.persistenceAvailable() and "Save" or "Save (n/a)")
+
+    local loadButton = makeButton(actionRow, "Load", function()
+        Config.load()
+        toggleSpread.set(Config.get("noSpread"), true)
+        toggleRecoil.set(Config.get("noRecoil"), true)
+        selectorMethod.set(Config.get("recoilMethod"), true)
+        keybindButton.set("Keybind: " .. tostring(Config.get("keybind")))
+        if toggleSpread.get() then
+            NoSpread.enable()
+        else
+            NoSpread.disable()
+        end
+        if toggleRecoil.get() then
+            NoRecoil.enable(Config.get("recoilMethod"))
+        else
+            NoRecoil.disable()
+        end
+        refreshDiagnosticsText()
+    end)
+
+    if not Config.persistenceAvailable() then
+        saveButton.set("Save (n/a)")
+    end
+
+    if actionRow then
+        for _, child in ipairs(actionRow:GetChildren()) do
+            if child:IsA("GuiObject") and string.find(child.Name, "Button_", 1, true) then
+                child.Size = UDim2.new(0.5, -Theme.gap / 2, 0, Theme.buttonHeight)
+            end
+        end
+    end
+
+    makeDiagnosticsPanel(body)
+
+    makeButton(body, "Unload", function()
+        unload()
+    end)
+
+    connect(titleBar.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            Gui.dragging = true
+            Gui.dragStart = input.Position
+            Gui.dragOrigin = window.Position
+        end
+    end)
+
+    connect(Services.UserInputService and Services.UserInputService.InputChanged, function(input)
+        if not Gui.dragging or not Gui.dragStart or not Gui.dragOrigin then
+            return
+        end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        local delta = input.Position - Gui.dragStart
+        local nextX = Gui.dragOrigin.X.Offset + delta.X
+        local nextY = Gui.dragOrigin.Y.Offset + delta.Y
+        window.Position = clampWindowPosition(nextX, nextY)
+    end)
+
+    connect(Services.UserInputService and Services.UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            if Gui.dragging then
+                Gui.dragging = false
+                Gui.dragStart = nil
+                Gui.dragOrigin = nil
+                Config.set("windowX", window.Position.X.Offset)
+                Config.set("windowY", window.Position.Y.Offset)
+            end
+        end
+    end)
+
+    if Gui.chevron then
+        connect(Gui.chevron.MouseButton1Click, function()
+            setCollapsed(Gui.body.Visible)
+        end)
+    end
+
+    connect(titleBar.MouseButton2Click, function()
+        Gui.hidden = true
+        window.Visible = false
+    end)
+
+    local closeButton = titleBar:FindFirstChild("Close")
+    if closeButton then
+        connect(closeButton.MouseButton1Click, function()
+            unload()
+        end)
+    end
+
+    connect(Services.UserInputService and Services.UserInputService.InputBegan, function(input, processed)
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            if Gui.awaitingKeybind then
+                Gui.awaitingKeybind = false
+                Config.set("keybind", input.KeyCode.Name)
+                keybindButton.set("Keybind: " .. input.KeyCode.Name)
+                refreshDiagnosticsText()
+                return
+            end
+            if processed then
+                return
+            end
+            if input.KeyCode == currentKeyCode() then
+                Gui.hidden = not Gui.hidden
+                window.Visible = not Gui.hidden
+            end
+        end
+    end)
+
+    local workspace = Services.Workspace
+    local camera = workspace and workspace.CurrentCamera
+    if camera then
+        connect(camera:GetPropertyChangedSignal("ViewportSize"), function()
+            applyStoredPosition()
+        end)
+    end
+
+    connect(Services.RunService and Services.RunService.Heartbeat, function()
+        refreshDiagnosticsText()
+    end)
+
+    local players = Services.Players
+    if players then
+        local player = players.LocalPlayer
+        if player then
+            connect(player.CharacterAdded, function()
+                Surface.clearCache()
+                diag("info", "character respawned; surface cache cleared")
+                task.defer(function()
+                    if NoRecoil.enabled then
+                        NoRecoil.disable()
+                        NoRecoil.enable(Config.get("recoilMethod"))
+                    end
+                end)
+            end)
+        end
+    end
+
+    Gui.toggleSpread = toggleSpread
+    Gui.toggleRecoil = toggleRecoil
+    Gui.executorName = executorName
+
+    applyStoredPosition()
+    if Config.get("collapsed") then
+        setCollapsed(true)
+    end
+
+    return true
+end
+
+unload = function()
+    if Gui.screenGui then
+        safeCall("unload/destroyGui", function()
+            Gui.screenGui:Destroy()
+        end)
+        Gui.screenGui = nil
+    end
+
+    NoRecoil.disable()
+    NoSpread.disable()
+    ShotBus.clear()
+    disconnectAll()
+    Diag.clear()
+
+    table.clear(Gui.widgets)
+    Gui.window = nil
+    Gui.titleBar = nil
+    Gui.body = nil
+    Gui.diagnosticsFrame = nil
+    Gui.diagnosticsLabel = nil
+    Gui.dragging = false
+    Gui.dragStart = nil
+    Gui.dragOrigin = nil
+    Gui.awaitingKeybind = false
+
+    Surface.clearCache()
+
+    local API = rawget(REGISTRY_ENV, "__pena")
+    if type(API) == "table" and type(API.unload) == "function" and API.unload == unload then
+        REGISTRY_ENV.__pena = nil
+    end
+end
+
+-- ============================================================================
+-- 11. BOOTSTRAP
+-- ============================================================================
+
+local API = {
+    version = "1.0.0",
+    unload = unload,
+    config = Config,
+    noSpread = NoSpread,
+    noRecoil = NoRecoil,
+    diagnostics = Diag,
+}
+
+REGISTRY_ENV.__pena = API
+
+local function bootstrap()
+    Config.load()
+
+    local executorName = "unknown"
+    if EXEC.identify then
+        local okIdentify, name = pcall(EXEC.identify)
+        if okIdentify and type(name) == "string" and name ~= "" then
+            executorName = name
+        end
+    end
+
+    diag("info", "pena " .. API.version .. " | executor: " .. executorName)
+    diag("info", "persistence: " .. (Config.persistenceAvailable() and "available" or "in-memory only"))
+
+    if not buildWindow() then
+        diag("warn", "running headless: features still install, no window")
+    end
+
+    if Config.get("noSpread") then
+        NoSpread.enable()
+    end
+
+    if Config.get("noRecoil") then
+        NoRecoil.enable(Config.get("recoilMethod"))
+    end
+
+    refreshDiagnosticsText()
+
+    print(string.format(
+        "[pena] loaded %s | spread: %s | recoil: %s | key: %s",
+        API.version,
+        NoSpread.status(),
+        NoRecoil.status(),
+        tostring(Config.get("keybind"))
+    ))
+end
+
+local okBootstrap, bootstrapError = xpcall(bootstrap, function(message)
+    return tostring(message) .. "\n" .. debug.traceback()
+end)
+
+if not okBootstrap then
+    warn("[pena] bootstrap failed: " .. tostring(bootstrapError))
+end
+
